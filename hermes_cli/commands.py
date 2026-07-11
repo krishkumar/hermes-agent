@@ -827,12 +827,19 @@ def _collect_gateway_skill_entries(
 
     # --- Tier 2: Built-in skill commands (trimmed at cap) -----------------
     _platform_disabled: set[str] = set()
+    _pinned: set[str] = set()
     try:
-        from agent.skill_utils import get_disabled_skill_names
+        from agent.skill_utils import get_disabled_skill_names, get_pinned_skill_names
         _platform_disabled = get_disabled_skill_names(platform=platform)
+        # Pinned skills float ahead of the alphabetical fill so they survive
+        # the per-platform cap (e.g. Telegram's 30-entry menu).
+        _pinned = get_pinned_skill_names(platform=platform)
     except Exception:
         pass
 
+    # Collected pinned-first, then alphabetical, so pinned skills claim the
+    # earliest skill slots when the menu is trimmed at the cap.
+    pinned_triples: list[tuple[str, str, str]] = []
     skill_triples: list[tuple[str, str, str]] = []
     try:
         from agent.skill_commands import get_skill_commands
@@ -870,9 +877,15 @@ def _collect_gateway_skill_entries(
             desc = info.get("description", "")
             if len(desc) > desc_limit:
                 desc = desc[:desc_limit - 3] + "..."
-            skill_triples.append((name, desc, cmd_key))
+            if skill_name in _pinned:
+                pinned_triples.append((name, desc, cmd_key))
+            else:
+                skill_triples.append((name, desc, cmd_key))
     except Exception:
         pass
+
+    # Pinned skills first (alphabetical within each group), then the rest.
+    skill_triples = pinned_triples + skill_triples
 
     # Clamp names; cmd_key is passed through as extra payload so it survives
     # any clamp-induced renames.
@@ -891,39 +904,85 @@ def _collect_gateway_skill_entries(
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
 
+def resolve_platform_menu_max(platform: str, default: int) -> int:
+    """Resolve the per-platform slash-menu cap from config (data-driven).
+
+    Reads ``skills.platform_menu_max.<platform>`` from config.yaml and falls
+    back to *default* when unset/invalid.  Clamped to ``[1, 100]`` — 100 is
+    Telegram's hard Bot API ceiling and a sane upper bound for Discord too.
+
+    This is what makes the menu size a config knob instead of a source
+    constant: a user can widen the Telegram menu to show more skills without
+    a code change.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config() or {}
+        skills_cfg = cfg.get("skills") if isinstance(cfg, dict) else None
+        menu_max = (skills_cfg or {}).get("platform_menu_max") or {}
+        val = menu_max.get(platform)
+        if val is not None:
+            return max(1, min(100, int(val)))
+    except Exception:
+        pass
+    return default
+
+
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
-    """Return Telegram menu commands capped to the Bot API limit.
+    """Return Telegram menu commands, fully data-driven from config.yaml.
 
-    Priority order (higher priority = never bumped by overflow):
-      1. Core CommandDef commands (always included)
-      2. Plugin slash commands (take precedence over skills)
-      3. Built-in skill commands (fill remaining slots, alphabetical)
+    Cap: ``skills.platform_menu_max.telegram`` (falls back to *max_commands*).
 
-    Skills are the only tier that gets trimmed when the cap is hit.
+    Assembly order (everything below is config-driven, not hardcoded):
+      1. Pinned skills (``skills.platform_pinned.telegram``) — **guaranteed**;
+         they bump the lowest-priority core commands when the cap is tight,
+         so a ``y``-prefixed skill like ``youtube-audio`` survives.
+      2. Core CommandDef commands (priority order).
+      3. Remaining skills (pinned-first, then alphabetical) fill leftover slots.
+
     User-installed hub skills are excluded — accessible via /skills.
-    Skills disabled for the ``"telegram"`` platform (via ``hermes skills
-    config``) are excluded from the menu entirely.
+    Skills disabled for the ``"telegram"`` platform are excluded entirely.
 
     Returns:
         (menu_commands, hidden_count) where hidden_count is the number of
-        commands omitted due to the cap.
+        candidate commands omitted due to the cap.
     """
-    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
-    reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
-    hidden_core_count = max(0, len(all_commands) - max_commands)
+    max_commands = resolve_platform_menu_max("telegram", max_commands)
 
-    remaining_slots = max(0, max_commands - len(all_commands))
-    entries, hidden_count = _collect_gateway_skill_entries(
+    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
+
+    # Collect every eligible skill (collector floats pinned skills first).
+    # Use an effectively unbounded budget so all pinned skills resolve and the
+    # hidden count is accurate; final trimming happens after assembly below.
+    skill_entries, _ = _collect_gateway_skill_entries(
         platform="telegram",
-        max_slots=remaining_slots,
-        reserved_names=reserved_names,
+        max_slots=10_000,
+        reserved_names=set(),
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
     )
-    # Drop the cmd_key — Telegram only needs (name, desc) pairs.
-    all_commands.extend((n, d) for n, d, _k in entries)
-    return all_commands[:max_commands], hidden_count + hidden_core_count
+    try:
+        from agent.skill_utils import get_pinned_skill_names
+        pinned = {_sanitize_telegram_name(n) for n in get_pinned_skill_names(platform="telegram")}
+    except Exception:
+        pinned = set()
+    pinned_entries = [(n, d) for n, d, _k in skill_entries if n in pinned]
+    other_entries = [(n, d) for n, d, _k in skill_entries if n not in pinned]
+
+    # Pinned skills (guaranteed) → core (priority) → remaining skills.
+    # Dedupe by name; earlier groups win, so a pinned skill outranks a
+    # same-named core command and core outranks a non-pinned skill.
+    all_commands: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for group in (pinned_entries, core_commands, other_entries):
+        for n, d in group:
+            if n in seen:
+                continue
+            seen.add(n)
+            all_commands.append((n, d))
+
+    hidden_count = max(0, len(all_commands) - max_commands)
+    return all_commands[:max_commands], hidden_count
 
 
 def discord_skill_commands(

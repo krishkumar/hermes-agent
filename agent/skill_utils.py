@@ -392,6 +392,52 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def get_pinned_skill_names(platform: str | None = None) -> Set[str]:
+    """Read pinned skill names from config.yaml.
+
+    Pinned skills are floated to the front of the gateway slash-command menu
+    (ahead of the alphabetical skill fill) so they survive the per-platform
+    command cap — e.g. Telegram's 30-entry menu, where ``y``-prefixed skills
+    would otherwise never appear.  Matched by skill ``name:`` (the same key
+    used for ``skills.disabled``).
+
+    Resolution mirrors :func:`get_disabled_skill_names`:
+        ``skills.platform_pinned.<platform>`` when a platform is resolved,
+        otherwise the global ``skills.pinned`` list.
+
+    Reads the config file directly (no CLI config imports) to stay
+    lightweight.
+    """
+    config_path = get_config_path()
+    if not config_path.exists():
+        return set()
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug("Could not read skill config %s: %s", config_path, e)
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+
+    from gateway.session_context import get_session_env
+    resolved_platform = (
+        platform
+        or os.getenv("HERMES_PLATFORM")
+        or get_session_env("HERMES_SESSION_PLATFORM")
+    )
+    if resolved_platform:
+        platform_pinned = (skills_cfg.get("platform_pinned") or {}).get(
+            resolved_platform
+        )
+        if platform_pinned is not None:
+            return _normalize_string_set(platform_pinned)
+    return _normalize_string_set(skills_cfg.get("pinned"))
+
+
 def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()
