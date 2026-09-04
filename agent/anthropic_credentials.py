@@ -250,6 +250,28 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials (Keychain and/or file). When both exist: prefer the only
     non-expired one (Claude Code 2.1.x refreshes one source but not the other), else the later ``expiresAt`` so a
     refresh uses the freshest refreshToken. ~/.claude.json primaryApiKey is deliberately excluded."""
+    # Opt out of borrowing Claude Code's credential entirely.
+    #
+    # Refreshing here rotates Claude Code's single-use refresh token, but
+    # _write_claude_code_credentials() only writes the rotated pair back to
+    # ~/.claude/.credentials.json -- never the macOS Keychain that Claude Code
+    # actually reads on Darwin. Claude Code is then left holding a refresh
+    # token the server has already burned, and its next refresh fails with
+    # invalid_grant, logging the user out. This function is the single choke
+    # point for every borrow path, so gating here disables all of them and
+    # lets resolve_anthropic_token() fall through to Hermes' own credentials.
+    if os.getenv("HERMES_DISABLE_CLAUDE_CODE_CREDENTIALS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.debug(
+            "Claude Code credential borrowing disabled via "
+            "HERMES_DISABLE_CLAUDE_CODE_CREDENTIALS"
+        )
+        return None
+
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
     if not (kc_creds and file_creds):
